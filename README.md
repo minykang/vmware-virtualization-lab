@@ -8,6 +8,9 @@
 
 6대의 노트북을 활용하여 총 **12대의 ESXi 호스트**를 구축하고, **하나의 vCenter**로 통합 관리하는 대규모 가상화 랩(Lab) 환경을 구성하였습니다.
 
+- 목적: 실제 기업 환경과 유사한 다중 노드 클러스터 환경을 구축하여 고가용성(HA) 및 자원 관리(DRS) 실습
+- 담당 역할: 인프라 설계 및 vSphere 통합 관리 환경 구축
+
 | 항목 | 내용 |
 |------|------|
 | **핵심 기술** | Nested Virtualization, VLAN/Subnet 분리, vMotion, Shared Storage (TrueNAS) |
