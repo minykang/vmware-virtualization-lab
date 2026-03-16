@@ -1,4 +1,4 @@
-# 🖥️ VMware vSphere Nested 가상화 실습 랩 (Team1)
+# 🖥️ Enterprise-Scale vSphere Nested Lab Project
 
 > **개인 학습 포트폴리오** | VMware Workstation 기반 중첩 가상화(Nested Virtualization) 환경 구축 및 vSphere 관리 실습
 
