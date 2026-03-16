@@ -51,6 +51,7 @@
 28. [클러스터 설정 — HA (High Availability)](#28-ha-high-availability)
 29. [Resource Pool 설정 및 활용](#29-resource-pool-설정-및-활용)
 30. [Linux 마스터 템플릿 제작 및 배포](#30-linux-마스터-템플릿-제작-및-배포)
+31. [NFS 기반 고가용성 공유 웹 서비스 구축](#31-nfs-기반-고가용성-공유-웹-서비스-구축)
 
 ---
 
@@ -1528,6 +1529,183 @@ ping 8.8.8.8
 
 ---
 
+## 31. NFS 기반 고가용성 공유 웹 서비스 구축
+
+> 여러 대의 웹 서버가 NFS 서버를 중앙 저장소로 공유하여, 콘텐츠 한 곳만 수정해도 모든 웹 서버에 즉시 반영되는 **고가용성 공유 웹 서비스** 환경을 구축한 실습입니다.
+
+### 시스템 아키텍처
+
+```
+                  ┌─────────────────────────────┐
+                  │   NFS-Ser (10.10.40.160)     │
+                  │   공유 디렉토리: /nfs/web     │
+                  │   index.html → "hello2 team1"│
+                  └────────────┬────────────────┘
+                               │  NFS Mount (rw, sync)
+              ┌────────────────┼────────────────┐
+              │                │                │
+  ┌───────────▼──┐  ┌──────────▼──┐  ┌──────────▼──┐
+  │  NFS-Web01   │  │  NFS-Web02  │  │  NFS-Web03  │
+  │ 10.10.40.161 │  │ 10.10.40.x  │  │ 10.10.40.x  │
+  │/var/www/html │  │/var/www/html│  │/var/www/html│
+  └──────────────┘  └─────────────┘  └─────────────┘
+         ↑
+  브라우저 접속 시
+  "hello2 team1.com" 동일 출력
+```
+
+### 구성 정보
+
+| 구분 | 호스트명 | IP 주소 | 역할 |
+|------|---------|---------|------|
+| 중앙 NFS 서버 | `NFS-Ser` | `10.10.40.160` | 공유 웹 콘텐츠 저장 및 제공 |
+| 웹 서버 1 | `NFS-Web01` | `10.10.40.161` | Apache 웹 서버 (NFS 마운트) |
+| 웹 서버 2 | `NFS-Web02` | `10.10.40.x` | Apache 웹 서버 (NFS 마운트) |
+| 웹 서버 3 | `NFS-Web03` | `10.10.40.x` | Apache 웹 서버 (NFS 마운트) |
+| 네트워크 대역 | — | `10.10.40.x` | 스토리지/서비스 전용 대역 |
+| 공유 디렉토리 (서버) | — | `/nfs/web` | NFS 서버 측 공유 경로 |
+| 마운트 포인트 (클라이언트) | — | `/var/www/html` | 각 웹 서버의 Apache 루트 |
+
+---
+
+### 1단계: NFS 서버 설정 (`NFS-Ser`)
+
+**① 공유 디렉토리 및 콘텐츠 생성**
+
+```bash
+# 공유 디렉토리 생성
+mkdir -p /nfs/web
+
+# 웹 콘텐츠(index.html) 작성
+echo "hello2 team1.com" > /nfs/web/index.html
+```
+
+**② `/etc/exports` 내보내기 설정**
+
+클라이언트 대역(`10.10.40.x`)이 읽기/쓰기 가능하도록 권한을 부여합니다.
+
+```bash
+# /etc/exports 파일에 추가
+/nfs/web    10.10.40.0/24(rw,sync,no_root_squash)
+```
+
+| 옵션 | 설명 |
+|------|------|
+| `rw` | 읽기/쓰기 권한 허용 |
+| `sync` | 데이터를 디스크에 즉시 동기화하여 안정성 확보 |
+| `no_root_squash` | 클라이언트의 root 권한을 서버에서도 root로 유지 (일반 환경에서는 보안상 주의) |
+
+**③ NFS 서비스 활성화 및 적용**
+
+```bash
+# exports 설정 즉시 적용
+exportfs -r
+
+# nfs-server 서비스 활성화 및 시작
+systemctl enable nfs-server
+systemctl start nfs-server
+
+# 서비스 상태 확인
+systemctl status nfs-server
+
+# 공유 목록 확인
+exportfs -v
+```
+
+---
+
+### 2단계: 웹 서버 NFS 마운트 (`NFS-Web01~03` 각각 반복)
+
+**① Apache 설치 (미설치 시)**
+
+```bash
+dnf install httpd -y
+systemctl enable httpd
+systemctl start httpd
+```
+
+**② NFS 마운트**
+
+```bash
+# NFS 서버의 공유 디렉토리를 Apache 웹 루트에 마운트
+mount -t nfs 10.10.40.160:/nfs/web /var/www/html
+```
+
+**③ 마운트 확인**
+
+```bash
+# NFS 서버 데이터가 실시간으로 동기화되는지 확인
+cat /var/www/html/index.html
+# 출력: hello2 team1.com
+
+# 마운트 상태 확인
+df -h | grep nfs
+mount | grep nfs
+```
+
+**④ 영구 마운트 설정 (`/etc/fstab`)**
+
+재부팅 후에도 자동으로 마운트되도록 fstab에 등록합니다.
+
+```bash
+# /etc/fstab 파일에 추가
+10.10.40.160:/nfs/web    /var/www/html    nfs    defaults    0 0
+```
+
+---
+
+### 3단계: 최종 서비스 확인
+
+**브라우저 접속 테스트**
+
+```
+http://10.10.40.161   (NFS-Web01)
+http://10.10.40.162   (NFS-Web02)
+http://10.10.40.163   (NFS-Web03)
+
+→ 모든 서버에서 동일하게 "hello2 team1.com" 출력 확인
+```
+
+**NFS 서버에서 콘텐츠 수정 → 전체 반영 확인**
+
+```bash
+# NFS 서버(NFS-Ser)에서만 수정
+echo "updated content - team1.com" > /nfs/web/index.html
+
+# 웹 서버(NFS-Web01~03)에서 즉시 반영 확인 (재시작 불필요)
+curl http://10.10.40.161
+# 출력: updated content - team1.com
+```
+
+---
+
+### 프로젝트 성과 및 배운 점
+
+| 배운 점 | 내용 |
+|--------|------|
+| **중앙 집중식 관리** | NFS 서버 한 곳에서만 콘텐츠를 수정하면 모든 웹 서버에 즉시 반영됨 — 배포 효율 극대화 |
+| **네트워크 분리 이해** | vMotion/Storage 전용 대역(`10.10.40.x`)을 활용한 데이터 전송의 중요성 학습 |
+| **서비스 안정성** | `nfs-server` 서비스의 상태 모니터링을 통해 엔터프라이즈급 인프라 구성의 기초 확립 |
+| **NFS exports 옵션** | `rw`, `sync`, `no_root_squash` 등 각 옵션의 의미와 보안적 영향 이해 |
+| **fstab 영구 마운트** | 재부팅 후에도 NFS 마운트를 유지하는 `/etc/fstab` 등록 방법 습득 |
+
+### 아키텍처 확장 아이디어
+
+```
+현재 구성:
+  NFS 서버 1대 → 웹 서버 3대 (단순 공유)
+
+확장 시:
+  Load Balancer (HAProxy / Nginx)   ← 트래픽 분산
+       ├── NFS-Web01
+       ├── NFS-Web02   ← NFS 공유 웹 서버 N대
+       └── NFS-Web03
+              ↓
+         [ NFS-Ser ]   ← 단일 콘텐츠 소스 (한 곳 수정 → 전체 반영)
+```
+
+---
+
 ## 📁 프로젝트 주요 체크리스트
 
 - [x] VMware Workstation 네트워크(VMnet) 구성 (VMnet0 Bridged, VMnet1 Host-only)
@@ -1564,6 +1742,10 @@ ping 8.8.8.8
 - [x] HA 설정 및 고가용성 실험 (단일 데이터스토어 클러스터)
 - [x] Resource Pool 설정 및 CPU Limit 적용 (Jongyeon-pool)
 - [x] Rocky Linux 마스터 템플릿 제작 및 배포 (일반화 → 템플릿 변환 → Customization Spec)
+- [x] NFS 서버 구성 (`/etc/exports`, `exportfs`, `nfs-server` 서비스 활성화)
+- [x] NFS 클라이언트 마운트 (`mount -t nfs`) 및 `/etc/fstab` 영구 마운트 등록
+- [x] NFS 기반 공유 웹 서비스 구축 (NFS-Ser + NFS-Web01/02/03, Apache `/var/www/html` 마운트)
+- [x] 중앙 집중식 콘텐츠 관리 — 서버 한 곳 수정 시 전체 웹 서버 즉시 반영 확인
 
 ---
 
@@ -1595,6 +1777,8 @@ ping 8.8.8.8
 `OpenMediaVault` `OMV` `StarWind` `Fusion Pool` `Deduplication`
 `Rocky Linux` `vmtoolsd` `ifcfg` `BOOTPROTO` `ONBOOT`
 `Windows Server` `W32Time` `NtpServer` `AnnounceFlags` `w32tm`
+`NFS-Ser` `NFS-Web` `exports` `exportfs` `no_root_squash` `nfs-server` `fstab` `mount -t nfs`
+`Apache` `httpd` `index.html` `공유 웹 서비스` `중앙 집중식 관리` `High Availability Web`
 
 ---
 
@@ -1613,3 +1797,6 @@ ping 8.8.8.8
 - Linux 템플릿 제작 시 Machine ID, 네트워크 설정, 로그를 반드시 초기화해야 복제 후 IP/호스트네임 충돌이 발생하지 않습니다.
 - vCenter 백업은 VAMI(`https://vCenter_IP:5480`) → [백업] 메뉴에서 FTP/FTPS/HTTP/HTTPS/NFS/SMB 등 다양한 프로토콜로 설정 가능합니다.
 - DRS는 클러스터 단위 기능이므로 반드시 **클러스터 생성 후 활성화**해야 합니다.
+- NFS 서버의 `/etc/exports` 수정 후 반드시 `exportfs -r` 명령으로 즉시 적용해야 클라이언트에서 인식됩니다.
+- NFS 마운트를 영구화하려면 `/etc/fstab`에 등록해야 하며, 미등록 시 재부팅 후 마운트가 해제됩니다.
+- `no_root_squash` 옵션은 클라이언트 root 권한을 서버에서도 유지하므로, 실습 이후 운영 환경에서는 `root_squash`(기본값) 사용을 권장합니다.
