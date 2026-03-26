@@ -86,33 +86,85 @@ USB 부팅으로 ESXi를 설치하고, DCUI 인터페이스를 통해 Management
 
 ---
 
-## 💾 03 — 공유 스토리지 구성 (iSCSI / NFS)
+## 💾 03. 공유 스토리지 구성 (iSCSI 기반 VMFS)
 
-> 모든 ESXi 호스트가 동일한 스토리지를 공유하는 환경 구성 — vMotion · HA의 필수 전제 조건
 
-### 1. Windows Server iSCSI Target 설정
+vSphere 클러스터의 핵심 기능인 **vMotion**과 **HA(High Availability)**를 구현하기 위해, Windows Server를 활용한 iSCSI 공유 스토리지 환경을 구축했습니다.
 
-- Windows Server에서 iSCSI Target 역할 추가 및 가상 디스크(VHD) 생성
-- 이니시에이터 IQN 등록 및 접근 권한 부여
+---
 
-### 2. ESXi iSCSI Initiator 연결 및 VMFS 데이터스토어 생성
+### 1. 개요 및 의사결정 (Storage Strategy)
 
-- 각 ESXi 호스트에서 소프트웨어 iSCSI 어댑터 추가
-- Storage 전용 VMkernel에 포트 바인딩하여 트래픽 격리
-- Dynamic Discovery로 Target 등록 → LUN 인식 → VMFS 6 데이터스토어 생성
+본 프로젝트에서는 vMotion 및 HA의 핵심인 **공유 스토리지**를 구축하기 위해 NFS(File Storage)와 iSCSI(Block Storage) 방식을 검토했습니다. 최종적으로 엔터프라이즈 환경에서 성능과 데이터 정합성이 뛰어난 **iSCSI(VMFS)** 방식을 채택했습니다.
 
-### 3. NFS 공유 스토리지
+**📍 NFS vs iSCSI(VMFS) 비교 분석**
+| **항목** | **NFS (Network File System)** | **iSCSI (VMFS)** |
+| --- | --- | --- |
+| **저장소 유형** | **파일 기반** 스토리지 | **블록 기반** 스토리지 |
+| **파일 시스템** | 스토리지 서버(OS)가 관리 | **ESXi(VMFS)**가 직접 관리 |
+| **데이터 정합성** | 파일 잠금(File Locking) 방식 | **분산 잠금(Distributed Locking)** |
+| **성능 특성** | 구성이 간편하나 오버헤드 존재 | 로컬 디스크와 유사한 고성능 I/O |
+| **주요 장점** | 다중 호스트 연결이 매우 직관적임 | 가상화 최적화 기능(VAAI 등) 지원 |
 
-- NFS Share 마운트 → ESXi 전체 호스트 자동 전파
-- 데이터스토어 자동 전파 원리 (vCenter 중앙 관리 / 동일 스토리지 구독 / 클러스터 내 공유 정책)
+### 📍 iSCSI(VMFS) 채택 사유
 
-### iSCSI vs NFS 비교
+1. **VMFS 6의 기술적 우위:** VMFS는 여러 호스트가 동시에 읽고 쓰기를 수행할 때 발생할 수 있는 데이터 충돌을 방지하는 **Distributed Locking** 메커니즘을 내장하고 있어, 클러스터 환경에서 데이터 무결성을 완벽하게 보장합니다.
+2. **고성능 워크로드 지원:** 블록 레벨의 데이터 전송을 통해 오버헤드를 줄여, 실제 운영 환경의 DB나 고부하 VM 운영에 더 적합하다고 판단했습니다.
+3. **고급 기능 활용:** vSphere의 하드웨어 가속(VAAI) 기능을 활용하여 스토리지 작업의 부하를 네트워크가 아닌 스토리지 레벨에서 처리할 수 있는 확장성을 고려했습니다.
 
-| 항목 | iSCSI (VMFS) | NFS |
-|------|-------------|-----|
-| 프로토콜 계층 | 블록 스토리지 | 파일 스토리지 |
-| 동시 접근 | 단일 호스트 전용 | 다중 호스트 동시 가능 |
-| 주요 용도 | 고성능 VM 워크로드 | 공유 템플릿 · ISO 배포 |
+---
+
+### 2. Windows Server: iSCSI Target 설정
+
+Windows Server를 '하드디스크를 빌려주는 주인'으로 만드는 과정입니다.
+
+### 📍 Step 1: iSCSI 대상 서버 역할 설치
+
+1. **서버 관리자** 실행 → [관리] → [역할 및 기능 추가].
+2. `파일 및 저장소 서비스` > `파일 및 iSCSI 서비스` > **[iSCSI 대상 서버]** 체크 후 설치.
+![이미지](images/image_3_1.png)
+
+### 📍 Step 2: iSCSI 가상 디스크 및 대상(Target) 지정
+
+1. **가상 디스크 생성:** 300GB 용량의 `.vhdx` 파일을 생성합니다.
+2. **접근 권한(IQN) 등록:** 각 ESXi 호스트의 고유 식별자인 **IQN**을 등록하여 지정된 호스트만 스토리지를 점유할 수 있도록 보안을 설정합니다.
+    
+    > **IQN이란?** `iqn.1998-01.com.vmware:esxi-01` 처럼 IP가 바뀌어도 장치를 식별할 수 있는 고유 주소입니다.
+    > 
+
+---
+
+### 3. ESXi: iSCSI Initiator 연결 및 VMFS 구성
+
+각 ESXi 호스트에서 네트워크를 통해 300GB 디스크를 '내 것'처럼 인식시키는 과정입니다.
+
+### 📍 Step 1: 어댑터 활성화 및 네트워크 바인딩
+
+- [스토리지] > [어댑터] > **[소프트웨어 iSCSI 추가]**를 클릭합니다.
+![이미지](images/image_3_2.png)
+
+- **Port Binding:** 스토리지 전용 VMkernel 포트를 어댑터에 바인딩하여 관리 트래픽과의 간섭을 차단합니다.
+![이미지](images/image_3_3.png)
+
+### 📍 Step 2: Dynamic Discovery & Storage Rescan
+
+Windows Server가 공유해준 300GB 디스크를 ESXi 호스트가 네트워크 너머에서 '발견'하도록 유도하는 단계입니다.
+
+- **동적 검색(Dynamic Discovery):** iSCSI 대상 서버의 IP(**10.10.10.2**)와 기본 포트(**3260**)를 입력합니다. 이 과정에서 ESXi는 서버에 접속하여 나에게 할당된 LUN(Logical Unit Number) 목록을 자동으로 받아옵니다.
+
+- **스토리지 다시 검사(Rescan Storage):** 단순히 대상을 등록하는 것만으로는 디스크가 나타나지 않습니다. '다시 검사'를 실행하여 HBA(Host Bus Adapter)가 새로운 경로를 탐색하고, 운영체제가 장치를 인식하도록 강제합니다.
+
+- **인식 확인:** 정상적으로 연결되면 장치 목록에 `MSFT iSCSI Disk`라는 모델명과 함께 정확히 **300GB**의 사용 가능한 용량이 표시됩니다.
+
+---
+
+### 📍 Step 3: VMFS 6 데이터스토어 구성 (File System Strategy)
+
+인식된 가공되지 않은(Raw) 디스크를 vSphere가 데이터를 저장할 수 있는 최적의 상태로 포맷합니다.
+
+
+
+- **파티션 최적화:** '모든 사용 가능한 공간 사용'을 선택하여 300GB 전체를 하나의 거대한 컨테이너로 활용합니다. 이는 향후 VM 생성 시 용량 부족 문제를 방지하고 디스크 단편화를 줄여줍니다.
 
 ---
 
